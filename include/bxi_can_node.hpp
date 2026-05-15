@@ -1,6 +1,5 @@
 #pragma once
-
-#include "bxi_pci_drv.h"
+#include "linux/can.h"
 #include "communication/msg/canfd_packet.hpp"
 #include "stark-sdk.h"
 
@@ -14,13 +13,22 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <rclcpp/rclcpp.hpp>
 
 inline constexpr uint32_t BXI_PCI_DEFAULT_BUS_INDEX = 5;
 inline constexpr int BXI_PCI_RX_WAIT_TIME_MS = 100;
 inline constexpr std::size_t BXI_PCI_RX_BUFFER_SIZE = 1000;
+typedef struct
+{
+    unsigned int bus;
+    struct canfd_frame frame;
+}canfd_packet __attribute__((__aligned__(8)));
+
+typedef int (*canfd_rx_call)(void *arg, canfd_packet *msg);
 
 class BxiRosCanBridge : public rclcpp::Node {
 public:
@@ -338,9 +346,90 @@ private:
 
 using bxi_revo2_can_node = BxiRosCanBridge;
 
+class BxiPciRosRuntime {
+public:
+    static BxiPciRosRuntime& instance()
+    {
+        static BxiPciRosRuntime runtime;
+        return runtime;
+    }
+
+    BxiPciRosRuntime(const BxiPciRosRuntime&) = delete;
+    BxiPciRosRuntime& operator=(const BxiPciRosRuntime&) = delete;
+
+    ~BxiPciRosRuntime()
+    {
+        stop();
+    }
+
+    std::shared_ptr<bxi_revo2_can_node> ensure_bridge(uint32_t default_bus)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (!rclcpp::ok()) {
+            printf("[ERROR] rclcpp::init() must be called before init_bxipci_device()\n");
+            return nullptr;
+        }
+
+        if (!bridge_) {
+            bridge_ = std::make_shared<bxi_revo2_can_node>(BXI_PCI_RX_BUFFER_SIZE);
+            executor_ = std::make_unique<rclcpp::executors::MultiThreadedExecutor>(
+                rclcpp::ExecutorOptions(), 2);
+            executor_->add_node(bridge_);
+            spin_thread_ = std::thread([this]() {
+                executor_->spin();
+            });
+            printf("[BxiPci] ROS CAN bridge initialized successfully\n");
+        }
+
+        bridge_->set_default_bus(default_bus);
+        return bridge_;
+    }
+
+    std::shared_ptr<bxi_revo2_can_node> current_bridge()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return bridge_;
+    }
+
+    void stop()
+    {
+        std::thread spin_thread;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (executor_) {
+                executor_->cancel();
+            }
+            spin_thread = std::move(spin_thread_);
+        }
+
+        if (spin_thread.joinable()) {
+            spin_thread.join();
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (executor_ && bridge_) {
+            try {
+                executor_->remove_node(bridge_);
+            } catch (...) {
+            }
+        }
+        executor_.reset();
+        bridge_.reset();
+    }
+
+private:
+    BxiPciRosRuntime() = default;
+
+    std::mutex mutex_;
+    std::shared_ptr<bxi_revo2_can_node> bridge_;
+    std::unique_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
+    std::thread spin_thread_;
+};
+
 struct BxiDeviceContext {
     DeviceHandler *handle = nullptr;
-    std::shared_ptr<bxi_revo2_can_node> bridge;
     uint32_t bus = BXI_PCI_DEFAULT_BUS_INDEX;
     uint8_t slave_id = 0;
     bool is_canfd = true;
@@ -361,28 +450,12 @@ struct BxiDeviceContext {
             close_device_handler(handle, stark_get_protocol_type(handle));
             handle = nullptr;
         }
-        bridge.reset();
     }
 };
 
-inline std::weak_ptr<bxi_revo2_can_node> bxi_revo2_can_;
-inline std::mutex bxi_revo2_can_init_mutex;
-
-inline std::shared_ptr<bxi_revo2_can_node> ensure_bxipci_bridge(BxiDeviceContext& ctx,
-                                                                uint32_t default_bus = BXI_PCI_DEFAULT_BUS_INDEX)
+inline std::shared_ptr<bxi_revo2_can_node> ensure_bxipci_bridge(uint32_t default_bus = BXI_PCI_DEFAULT_BUS_INDEX)
 {
-    std::lock_guard<std::mutex> lock(bxi_revo2_can_init_mutex);
-
-    auto bridge = ctx.bridge ? ctx.bridge : bxi_revo2_can_.lock();
-    if (!bridge) {
-        bridge = std::make_shared<bxi_revo2_can_node>(BXI_PCI_RX_BUFFER_SIZE);
-        printf("[BxiPci] ROS CAN bridge initialized successfully\n");
-    }
-
-    bridge->set_default_bus(default_bus);
-    ctx.bridge = bridge;
-    bxi_revo2_can_ = bridge;
-    return bridge;
+    return BxiPciRosRuntime::instance().ensure_bridge(default_bus);
 }
 
 inline void setup_bxipci_can_callbacks()
@@ -391,7 +464,7 @@ inline void setup_bxipci_can_callbacks()
                            uint32_t can_id,
                            const uint8_t *data,
                            uintptr_t data_len) -> int {
-        auto bridge = bxi_revo2_can_.lock();
+        auto bridge = BxiPciRosRuntime::instance().current_bridge();
         if (!bridge) return -1;
 
         canfd_packet packet;
@@ -411,7 +484,7 @@ inline void setup_bxipci_can_callbacks()
                            uint32_t *can_id_out,
                            uint8_t *data_out,
                            uintptr_t *data_len_out) -> int {
-        auto bridge = bxi_revo2_can_.lock();
+        auto bridge = BxiPciRosRuntime::instance().current_bridge();
         if (!bridge) return -1;
 
         return bridge->receive_can(bridge->bus_for_slave(slave_id),
@@ -430,7 +503,7 @@ inline void setup_bxipci_canfd_callbacks()
                            uint32_t canfd_id,
                            const uint8_t *data,
                            uintptr_t data_len) -> int {
-        auto bridge = bxi_revo2_can_.lock();
+        auto bridge = BxiPciRosRuntime::instance().current_bridge();
         if (!bridge) return -1;
 
         canfd_packet packet;
@@ -452,7 +525,7 @@ inline void setup_bxipci_canfd_callbacks()
                            uint8_t *data_out,
                            uintptr_t *data_len_out) -> int {
         (void)expected_frames;
-        auto bridge = bxi_revo2_can_.lock();
+        auto bridge = BxiPciRosRuntime::instance().current_bridge();
         if (!bridge) return -1;
 
         return bridge->receive_canfd(bridge->bus_for_slave(slave_id),
@@ -476,7 +549,7 @@ inline bool init_bxipci_device(BxiDeviceContext* ctx,
     printf("\n[Init] Mode: BxiPci %s\n", is_canfd ? "(CANFD)" : "(CAN 2.0)");
     printf("  Bus: %u, Slave ID: %u\n", bus, slave_id);
 
-    auto bridge = ensure_bxipci_bridge(*ctx, bus);
+    auto bridge = ensure_bxipci_bridge(bus);
     if (!bridge) {
         printf("[ERROR] Failed to initialize BxiPci ROS CAN bridge\n");
         return false;
