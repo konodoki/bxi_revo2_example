@@ -20,6 +20,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 inline constexpr uint32_t BXI_PCI_DEFAULT_BUS_INDEX = 5;
+inline constexpr uint8_t BXI_PCI_DEFAULT_MASTER_ID = 1;
 inline constexpr int BXI_PCI_RX_WAIT_TIME_MS = 100;
 inline constexpr std::size_t BXI_PCI_RX_BUFFER_SIZE = 1000;
 typedef struct
@@ -431,6 +432,7 @@ private:
 struct BxiDeviceContext {
     DeviceHandler *handle = nullptr;
     uint32_t bus = BXI_PCI_DEFAULT_BUS_INDEX;
+    uint8_t master_id = BXI_PCI_DEFAULT_MASTER_ID;
     uint8_t slave_id = 0;
     bool is_canfd = true;
     StarkHardwareType hw_type_override = static_cast<StarkHardwareType>(0);
@@ -547,7 +549,10 @@ inline bool init_bxipci_device(BxiDeviceContext* ctx,
     }
 
     printf("\n[Init] Mode: BxiPci %s\n", is_canfd ? "(CANFD)" : "(CAN 2.0)");
-    printf("  Bus: %u, Slave ID: %u\n", bus, slave_id);
+    printf("  Bus: %u, Master ID: %u, Slave ID: %u\n",
+           bus,
+           ctx->master_id,
+           slave_id);
 
     auto bridge = ensure_bxipci_bridge(bus);
     if (!bridge) {
@@ -569,13 +574,16 @@ inline bool init_bxipci_device(BxiDeviceContext* ctx,
     if (ctx->hw_type_override != 0) {
         printf("  Hardware type override: %d\n", ctx->hw_type_override);
         ctx->handle = init_device_handler_can_with_hw_type(protocol,
-                                                           1,
+                                                           ctx->master_id,
                                                            slave_id,
                                                            arb_baudrate,
                                                            data_baudrate,
                                                            ctx->hw_type_override);
     } else {
-        ctx->handle = init_device_handler_can(protocol, 1, arb_baudrate, data_baudrate);
+        ctx->handle = init_device_handler_can(protocol,
+                                              ctx->master_id,
+                                              arb_baudrate,
+                                              data_baudrate);
     }
 
     if (ctx->handle == NULL) {
@@ -589,7 +597,32 @@ inline bool init_bxipci_device(BxiDeviceContext* ctx,
     return true;
 }
 
+inline bool init_bxipci_device(BxiDeviceContext* ctx,
+                               uint32_t bus,
+                               uint8_t slave_id,
+                               bool is_canfd,
+                               uint8_t master_id)
+{
+    if (!ctx) {
+        return false;
+    }
+    ctx->master_id = master_id;
+    return init_bxipci_device(ctx, bus, slave_id, is_canfd);
+}
+
 inline bool init_bxipci_device(BxiDeviceContext* ctx, uint8_t slave_id, bool is_canfd)
 {
     return init_bxipci_device(ctx, BXI_PCI_DEFAULT_BUS_INDEX, slave_id, is_canfd);
+}
+
+inline bool init_bxipci_device(BxiDeviceContext* ctx,
+                               uint8_t slave_id,
+                               bool is_canfd,
+                               uint8_t master_id)
+{
+    return init_bxipci_device(ctx,
+                              BXI_PCI_DEFAULT_BUS_INDEX,
+                              slave_id,
+                              is_canfd,
+                              master_id);
 }

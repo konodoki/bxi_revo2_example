@@ -39,6 +39,14 @@ set_target_properties(bxi_revo2_example PROPERTIES
 install(TARGETS bxi_revo2_example
   DESTINATION lib/${PROJECT_NAME})
 
+install(PROGRAMS
+  src/bxi_revo2_example.py
+  DESTINATION lib/${PROJECT_NAME})
+
+install(FILES
+  src/bxi_can_node.py
+  DESTINATION lib/${PROJECT_NAME})
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights

@@ -339,6 +339,8 @@ int main(int argc, char **argv)
     BxiDeviceContext right_ctx_;
     left_ctx_.hw_type_override = STARK_HARDWARE_TYPE_REVO2_BASIC;
     right_ctx_.hw_type_override = STARK_HARDWARE_TYPE_REVO2_BASIC;
+    left_ctx_.master_id = 1;
+    right_ctx_.master_id = 1;
     if (!init_bxipci_device(&left_ctx_, 5, 126, true)) {
         rclcpp::shutdown();
         return 1;
