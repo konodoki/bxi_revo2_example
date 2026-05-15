@@ -210,43 +210,7 @@ bool init_modbus(DeviceContext* ctx, const char* port, uint32_t baudrate, uint8_
  */
 bool init_protobuf(DeviceContext* ctx, const char* port, uint8_t slave_id);
 
-/**
- * @brief Initialize device via ZQWL CAN/CANFD
- * @param ctx Output: Device context to fill
- * @param port Serial port path
- * @param arb_baudrate Arbitration baudrate (CAN 2.0 uses this as main baudrate)
- * @param data_baudrate Data baudrate (CANFD only, ignored for CAN 2.0)
- * @param slave_id Slave ID
- * @param is_canfd true for CANFD, false for CAN 2.0
- * @return true if successful
- */
-bool init_zqwl_device(DeviceContext* ctx, const char* port, uint32_t arb_baudrate, 
-                      uint32_t data_baudrate, uint8_t slave_id, bool is_canfd);
-
 #ifdef __linux__
-/**
- * @brief Initialize device via SocketCAN (using example's can_common.cpp implementation)
- *
- * This uses the example's own SocketCAN implementation in can_common.cpp.
- * All backends compiled by default on Linux, select at runtime.
- *
- * @param ctx Output: Device context to fill
- * @param iface CAN interface name (e.g., "can0")
- * @param slave_id Slave ID
- * @param is_canfd true for CANFD, false for CAN 2.0
- * @return true if successful
- */
-bool init_socketcan_device(DeviceContext* ctx, const char* iface, uint8_t slave_id, bool is_canfd);
-
-/**
- * @brief Initialize device via ZLG USB-CANFD
- * @param ctx Output: Device context to fill
- * @param slave_id Slave ID
- * @param is_canfd true for CANFD, false for CAN 2.0
- * @return true if successful
- */
-bool init_zlg_device(DeviceContext* ctx, uint8_t slave_id, bool is_canfd);
-
 /**
  * @brief Initialize device via BxiPci PCI CANFD adapter
  * @param ctx Output: Device context to fill
@@ -258,24 +222,8 @@ bool init_bxipci_device(DeviceContext* ctx, uint8_t slave_id, bool is_canfd);
 #endif
 
 /**
- * @brief Initialize device via SocketCAN (using SDK built-in implementation)
- * 
- * This uses the SDK's built-in SocketCAN support (init_socketcan_can/init_socketcan_canfd).
- * Available on all platforms; returns failure on non-Linux.
- * 
- * @param ctx Output: Device context to fill
- * @param iface CAN interface name (e.g., "can0"). If NULL, uses "can0"
- * @param slave_id Slave ID
- * @param is_canfd true for CANFD, false for CAN 2.0
- * @return true if successful
- */
-bool init_socketcan_device_builtin(DeviceContext* ctx, const char* iface, uint8_t slave_id, bool is_canfd);
-
-/**
  * @brief Parse command line arguments and initialize device
- * Supports: auto-detect, -m (Modbus), -c (CAN), -f (CANFD), 
- *           -s/-S (SocketCAN via can_common.cpp), -b/-B (SocketCAN via SDK built-in),
- *           -z/-Z (ZLG)
+ * Supports: -x/-X (BxiPci CAN/CANFD)
  * @param ctx Output: Device context to fill
  * @param argc Argument count
  * @param argv Argument values

@@ -17,7 +17,6 @@ find_package(std_msgs REQUIRED)
 find_package(communication REQUIRED)
 
 #revo2相关文件
-add_compile_definitions(STARK_USE_BXIPCI)
 file(GLOB_RECURSE revo2_source ${CMAKE_SOURCE_DIR}/common/*.cpp)
 
 add_executable(bxi_revo2_example src/bxi_revo2_example.cpp ${revo2_source})
