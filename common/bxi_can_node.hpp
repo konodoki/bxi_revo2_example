@@ -2,18 +2,25 @@
 
 #include "bxi_pci_drv.h"
 #include "communication/msg/canfd_packet.hpp"
+#include "stark-sdk.h"
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #include <rclcpp/rclcpp.hpp>
+
+inline constexpr uint32_t BXI_PCI_DEFAULT_BUS_INDEX = 5;
+inline constexpr int BXI_PCI_RX_WAIT_TIME_MS = 100;
+inline constexpr std::size_t BXI_PCI_RX_BUFFER_SIZE = 1000;
 
 class BxiRosCanBridge : public rclcpp::Node {
 public:
@@ -41,6 +48,11 @@ public:
 
         canfd_pub_ = this->create_publisher<communication::msg::CANFDPacket>(
             "canfd_packet/tx", rclcpp::QoS(100));
+    }
+
+    ~BxiRosCanBridge() override
+    {
+        clear_rx_queue();
     }
 
     int send_packet(const canfd_packet& msg)
@@ -71,18 +83,29 @@ public:
         return 1;
     }
 
-    int canfd_send_packet(canfd_packet *msg)
+    void set_default_bus(uint32_t bus)
     {
-        if (!msg) {
-            RCLCPP_ERROR(this->get_logger(), "TX packet is null");
-            return -1;
-        }
-        return send_packet(*msg);
+        std::lock_guard<std::mutex> lock(bus_mutex_);
+        default_bus_ = bus;
+    }
+
+    void register_slave_bus(uint8_t slave_id, uint32_t bus)
+    {
+        std::lock_guard<std::mutex> lock(bus_mutex_);
+        slave_bus_[slave_id] = bus;
+    }
+
+    uint32_t bus_for_slave(uint8_t slave_id)
+    {
+        std::lock_guard<std::mutex> lock(bus_mutex_);
+        auto it = slave_bus_.find(slave_id);
+        return (it == slave_bus_.end()) ? default_bus_ : it->second;
     }
 
     void push_rx_packet(const canfd_packet& msg)
     {
         RxFrame frame;
+        frame.bus = msg.bus;
         frame.can_id = msg.frame.can_id & CAN_EFF_MASK;
         frame.len = static_cast<uint8_t>(
             std::min<std::size_t>(msg.frame.len, kMaxCanFdDataLen));
@@ -99,7 +122,8 @@ public:
         rx_cv_.notify_all();
     }
 
-    int receive_can(uint32_t expected_can_id,
+    int receive_can(uint32_t expected_bus,
+                    uint32_t expected_can_id,
                     uint8_t expected_frames,
                     uint32_t *can_id_out,
                     uint8_t *data_out,
@@ -117,7 +141,10 @@ public:
         const bool is_multi_frame_cmd = (cmd == 0x0B || cmd == 0x0D);
         const int max_attempts = is_dfu_mode ? 200 : (expected_frames > 1 || is_multi_frame_cmd ? 5 : 2);
 
-        auto matches = [expected_can_id, is_dfu_mode](const RxFrame& frame) {
+        auto matches = [expected_bus, expected_can_id, is_dfu_mode](const RxFrame& frame) {
+            if (frame.bus != expected_bus) {
+                return false;
+            }
             return is_dfu_mode || expected_can_id == 0 || frame.can_id == expected_can_id;
         };
 
@@ -180,7 +207,8 @@ public:
         return -1;
     }
 
-    int receive_canfd(uint32_t expected_can_id,
+    int receive_canfd(uint32_t expected_bus,
+                      uint32_t expected_can_id,
                       uint32_t *canfd_id_out,
                       uint8_t *data_out,
                       uintptr_t *data_len_out,
@@ -193,7 +221,10 @@ public:
         const uint8_t expected_slave_id = (expected_can_id >> 16) & 0xFF;
         const uint8_t expected_master_id = (expected_can_id >> 8) & 0xFF;
 
-        auto matches = [expected_slave_id, expected_master_id](const RxFrame& frame) {
+        auto matches = [expected_bus, expected_slave_id, expected_master_id](const RxFrame& frame) {
+            if (frame.bus != expected_bus) {
+                return false;
+            }
             const uint8_t resp_slave_id = (frame.can_id >> 16) & 0xFF;
             const uint8_t resp_master_id = (frame.can_id >> 8) & 0xFF;
             return resp_slave_id == expected_slave_id && resp_master_id == expected_master_id;
@@ -224,6 +255,7 @@ private:
     static constexpr std::size_t kMaxCanFdDataLen = 64;
 
     struct RxFrame {
+        uint32_t bus = 0;
         uint32_t can_id = 0;
         uint8_t data[kMaxCanFdDataLen] = {};
         uint8_t len = 0;
@@ -298,7 +330,193 @@ private:
     std::deque<RxFrame> rx_frames_;
     std::mutex rx_mutex_;
     std::condition_variable rx_cv_;
+    std::mutex bus_mutex_;
+    uint32_t default_bus_ = BXI_PCI_DEFAULT_BUS_INDEX;
+    std::unordered_map<uint8_t, uint32_t> slave_bus_;
     std::size_t dropped_rx_frames_ = 0;
 };
 
 using bxi_revo2_can_node = BxiRosCanBridge;
+
+struct BxiDeviceContext {
+    DeviceHandler *handle = nullptr;
+    std::shared_ptr<bxi_revo2_can_node> bridge;
+    uint32_t bus = BXI_PCI_DEFAULT_BUS_INDEX;
+    uint8_t slave_id = 0;
+    bool is_canfd = true;
+    StarkHardwareType hw_type_override = static_cast<StarkHardwareType>(0);
+
+    BxiDeviceContext() = default;
+    BxiDeviceContext(const BxiDeviceContext&) = delete;
+    BxiDeviceContext& operator=(const BxiDeviceContext&) = delete;
+
+    ~BxiDeviceContext()
+    {
+        close();
+    }
+
+    void close()
+    {
+        if (handle) {
+            close_device_handler(handle, stark_get_protocol_type(handle));
+            handle = nullptr;
+        }
+        bridge.reset();
+    }
+};
+
+inline std::weak_ptr<bxi_revo2_can_node> bxi_revo2_can_;
+inline std::mutex bxi_revo2_can_init_mutex;
+
+inline std::shared_ptr<bxi_revo2_can_node> ensure_bxipci_bridge(BxiDeviceContext& ctx,
+                                                                uint32_t default_bus = BXI_PCI_DEFAULT_BUS_INDEX)
+{
+    std::lock_guard<std::mutex> lock(bxi_revo2_can_init_mutex);
+
+    auto bridge = ctx.bridge ? ctx.bridge : bxi_revo2_can_.lock();
+    if (!bridge) {
+        bridge = std::make_shared<bxi_revo2_can_node>(BXI_PCI_RX_BUFFER_SIZE);
+        printf("[BxiPci] ROS CAN bridge initialized successfully\n");
+    }
+
+    bridge->set_default_bus(default_bus);
+    ctx.bridge = bridge;
+    bxi_revo2_can_ = bridge;
+    return bridge;
+}
+
+inline void setup_bxipci_can_callbacks()
+{
+    set_can_tx_callback([](uint8_t slave_id,
+                           uint32_t can_id,
+                           const uint8_t *data,
+                           uintptr_t data_len) -> int {
+        auto bridge = bxi_revo2_can_.lock();
+        if (!bridge) return -1;
+
+        canfd_packet packet;
+        std::memset(&packet, 0, sizeof(packet));
+        packet.bus = bridge->bus_for_slave(slave_id);
+        packet.frame.can_id = can_id;
+        packet.frame.len = (data_len > 8) ? 8 : static_cast<uint8_t>(data_len);
+        std::memcpy(packet.frame.data, data, packet.frame.len);
+
+        const int ret = bridge->send_packet(packet);
+        return (ret > 0) ? 0 : -1;
+    });
+
+    set_can_rx_callback([](uint8_t slave_id,
+                           uint32_t expected_can_id,
+                           uint8_t expected_frames,
+                           uint32_t *can_id_out,
+                           uint8_t *data_out,
+                           uintptr_t *data_len_out) -> int {
+        auto bridge = bxi_revo2_can_.lock();
+        if (!bridge) return -1;
+
+        return bridge->receive_can(bridge->bus_for_slave(slave_id),
+                                   expected_can_id,
+                                   expected_frames,
+                                   can_id_out,
+                                   data_out,
+                                   data_len_out,
+                                   BXI_PCI_RX_WAIT_TIME_MS);
+    });
+}
+
+inline void setup_bxipci_canfd_callbacks()
+{
+    set_can_tx_callback([](uint8_t slave_id,
+                           uint32_t canfd_id,
+                           const uint8_t *data,
+                           uintptr_t data_len) -> int {
+        auto bridge = bxi_revo2_can_.lock();
+        if (!bridge) return -1;
+
+        canfd_packet packet;
+        std::memset(&packet, 0, sizeof(packet));
+        packet.bus = bridge->bus_for_slave(slave_id);
+        packet.frame.can_id = (canfd_id & CAN_EFF_MASK) | CAN_EFF_FLAG;
+        packet.frame.len = (data_len > 64) ? 64 : static_cast<uint8_t>(data_len);
+        packet.frame.flags = CANFD_BRS | CANFD_FDF;
+        std::memcpy(packet.frame.data, data, packet.frame.len);
+
+        const int ret = bridge->send_packet(packet);
+        return (ret > 0) ? 0 : -1;
+    });
+
+    set_can_rx_callback([](uint8_t slave_id,
+                           uint32_t expected_can_id,
+                           uint8_t expected_frames,
+                           uint32_t *canfd_id_out,
+                           uint8_t *data_out,
+                           uintptr_t *data_len_out) -> int {
+        (void)expected_frames;
+        auto bridge = bxi_revo2_can_.lock();
+        if (!bridge) return -1;
+
+        return bridge->receive_canfd(bridge->bus_for_slave(slave_id),
+                                     expected_can_id,
+                                     canfd_id_out,
+                                     data_out,
+                                     data_len_out,
+                                     BXI_PCI_RX_WAIT_TIME_MS);
+    });
+}
+
+inline bool init_bxipci_device(BxiDeviceContext* ctx,
+                               uint32_t bus,
+                               uint8_t slave_id,
+                               bool is_canfd)
+{
+    if (!ctx) {
+        return false;
+    }
+
+    printf("\n[Init] Mode: BxiPci %s\n", is_canfd ? "(CANFD)" : "(CAN 2.0)");
+    printf("  Bus: %u, Slave ID: %u\n", bus, slave_id);
+
+    auto bridge = ensure_bxipci_bridge(*ctx, bus);
+    if (!bridge) {
+        printf("[ERROR] Failed to initialize BxiPci ROS CAN bridge\n");
+        return false;
+    }
+
+    bridge->register_slave_bus(slave_id, bus);
+    if (is_canfd) {
+        setup_bxipci_canfd_callbacks();
+    } else {
+        setup_bxipci_can_callbacks();
+    }
+
+    StarkProtocolType protocol = is_canfd ? STARK_PROTOCOL_TYPE_CAN_FD : STARK_PROTOCOL_TYPE_CAN;
+    uint32_t arb_baudrate = 1000000;
+    uint32_t data_baudrate = is_canfd ? 5000000 : 1000000;
+
+    if (ctx->hw_type_override != 0) {
+        printf("  Hardware type override: %d\n", ctx->hw_type_override);
+        ctx->handle = init_device_handler_can_with_hw_type(protocol,
+                                                           1,
+                                                           slave_id,
+                                                           arb_baudrate,
+                                                           data_baudrate,
+                                                           ctx->hw_type_override);
+    } else {
+        ctx->handle = init_device_handler_can(protocol, 1, arb_baudrate, data_baudrate);
+    }
+
+    if (ctx->handle == NULL) {
+        printf("[ERROR] Failed to create device handler\n");
+        return false;
+    }
+
+    ctx->bus = bus;
+    ctx->slave_id = slave_id;
+    ctx->is_canfd = is_canfd;
+    return true;
+}
+
+inline bool init_bxipci_device(BxiDeviceContext* ctx, uint8_t slave_id, bool is_canfd)
+{
+    return init_bxipci_device(ctx, BXI_PCI_DEFAULT_BUS_INDEX, slave_id, is_canfd);
+}

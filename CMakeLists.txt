@@ -16,10 +16,7 @@ find_package(ament_cmake REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(communication REQUIRED)
 
-#revo2相关文件
-file(GLOB_RECURSE revo2_source ${CMAKE_SOURCE_DIR}/common/*.cpp)
-
-add_executable(bxi_revo2_example src/bxi_revo2_example.cpp ${revo2_source})
+add_executable(bxi_revo2_example src/bxi_revo2_example.cpp)
 target_include_directories(bxi_revo2_example PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
