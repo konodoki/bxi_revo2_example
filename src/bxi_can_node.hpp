@@ -21,7 +21,7 @@
 
 inline constexpr uint32_t BXI_PCI_DEFAULT_BUS_INDEX = 5;
 inline constexpr uint8_t BXI_PCI_DEFAULT_MASTER_ID = 1;
-inline constexpr int BXI_PCI_RX_WAIT_TIME_MS = 100;
+inline constexpr int BXI_PCI_RX_WAIT_TIME_MS = 250;
 inline constexpr std::size_t BXI_PCI_RX_BUFFER_SIZE = 1000;
 typedef struct
 {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BxiPci ROS CANFD bridge for the Python Stark SDK examples."""
+"""BxiPci ROS CAN/CANFD bridge for the Python Stark SDK examples."""
 
 from __future__ import annotations
 
@@ -41,13 +41,14 @@ else:
 
 
 BXI_PCI_DEFAULT_BUS_INDEX = 5
-BXI_PCI_RX_WAIT_TIME_MS = 100
+BXI_PCI_RX_WAIT_TIME_MS = 250
 BXI_PCI_RX_BUFFER_SIZE = 1000
 
 CAN_EFF_FLAG = 0x80000000
 CAN_EFF_MASK = 0x1FFFFFFF
 CANFD_BRS = 0x01
 CANFD_FDF = 0x04
+MAX_CAN_DATA_LEN = 8
 MAX_CANFD_DATA_LEN = 64
 
 
@@ -72,7 +73,9 @@ class BxiRosCanBridge(Node):
         self._rx_cv = threading.Condition()
         self._bus_lock = threading.Lock()
         self._default_bus = BXI_PCI_DEFAULT_BUS_INDEX
+        self._default_is_canfd = True
         self._slave_bus: Dict[int, int] = {}
+        self._slave_is_canfd: Dict[int, bool] = {}
 
         qos = QoSProfile(depth=100)
         self._rx_sub = self.create_subscription(
@@ -84,16 +87,39 @@ class BxiRosCanBridge(Node):
         with self._bus_lock:
             self._default_bus = int(bus)
 
+    def set_default_protocol(self, is_canfd: bool) -> None:
+        with self._bus_lock:
+            self._default_is_canfd = bool(is_canfd)
+
     def register_slave_bus(self, slave_id: int, bus: int) -> None:
         with self._bus_lock:
             self._slave_bus[int(slave_id) & 0xFF] = int(bus)
+
+    def register_slave(self, slave_id: int, bus: int, is_canfd: bool) -> None:
+        with self._bus_lock:
+            key = int(slave_id) & 0xFF
+            self._slave_bus[key] = int(bus)
+            self._slave_is_canfd[key] = bool(is_canfd)
 
     def bus_for_slave(self, slave_id: int) -> int:
         with self._bus_lock:
             return self._slave_bus.get(int(slave_id) & 0xFF, self._default_bus)
 
-    def send_packet(self, bus: int, can_id: int, data: bytes, flags: int = 0) -> bool:
-        payload = bytes(data[:MAX_CANFD_DATA_LEN])
+    def is_canfd_for_slave(self, slave_id: int) -> bool:
+        with self._bus_lock:
+            return self._slave_is_canfd.get(
+                int(slave_id) & 0xFF, self._default_is_canfd
+            )
+
+    def send_packet(
+        self,
+        bus: int,
+        can_id: int,
+        data: bytes,
+        flags: int = 0,
+        max_data_len: int = MAX_CANFD_DATA_LEN,
+    ) -> bool:
+        payload = bytes(data[:max_data_len])
 
         packet = CANFDPacket()
         packet.bus = int(bus)
@@ -102,10 +128,79 @@ class BxiRosCanBridge(Node):
         packet.frame.len = len(payload)
         self._set_frame_data(packet, payload)
         self._tx_pub.publish(packet)
+        frame_type = "CANFD" if (packet.frame.flags & CANFD_FDF) else "CAN"
         self.get_logger().debug(
-            f"CANFD TX bus={packet.bus} id=0x{packet.frame.can_id:08X} len={packet.frame.len}"
+            f"{frame_type} TX bus={packet.bus} id=0x{packet.frame.can_id:08X} "
+            f"len={packet.frame.len} flags=0x{packet.frame.flags:02X}"
         )
         return True
+
+    def receive_can(
+        self,
+        expected_bus: int,
+        expected_can_id: int,
+        expected_frames: int,
+        wait_time_ms: int,
+    ) -> Optional[Tuple[int, bytes]]:
+        expected_can_id = int(expected_can_id) & CAN_EFF_MASK
+        is_dfu_mode = expected_can_id == 0
+        cmd = (expected_can_id >> 3) & 0x0F
+        is_multi_frame_cmd = cmd in (0x0B, 0x0D)
+        if is_dfu_mode:
+            max_attempts = 200
+        elif expected_frames > 1 or is_multi_frame_cmd:
+            max_attempts = 5
+        else:
+            max_attempts = 2
+
+        def matches(frame: RxFrame) -> bool:
+            if frame.bus != expected_bus:
+                return False
+            return is_dfu_mode or expected_can_id == 0 or frame.can_id == expected_can_id
+
+        all_data = bytearray()
+        received_count = 0
+
+        for _ in range(max_attempts):
+            frame = self._wait_for_frame(matches, wait_time_ms / 1000.0)
+            if frame is None:
+                continue
+
+            can_id = frame.can_id
+            frame_data = frame.data
+
+            if is_multi_frame_cmd and frame_data:
+                frame_header = frame_data[0]
+
+                if cmd == 0x0B and len(frame_data) >= 2:
+                    len_and_flag = frame_data[1]
+                    is_last = (len_and_flag & 0x80) != 0
+                    all_data.extend(frame_data)
+                    received_count += 1
+
+                    if is_last:
+                        return can_id, bytes(all_data)
+                    continue
+
+                if cmd == 0x0D:
+                    total = (frame_header >> 4) & 0x0F
+                    seq = frame_header & 0x0F
+
+                    if total > 0 and seq > 0:
+                        all_data.extend(frame_data)
+                        received_count += 1
+
+                        if received_count >= total:
+                            return can_id, bytes(all_data)
+                        continue
+
+            all_data.extend(frame_data)
+            return can_id, bytes(all_data)
+
+        if all_data:
+            return expected_can_id, bytes(all_data)
+
+        return None
 
     def receive_canfd(
         self, expected_bus: int, expected_can_id: int, wait_time_ms: int
@@ -320,35 +415,83 @@ def _check_sdk() -> None:
         ) from _sdk_import_error
 
 
-def setup_bxipci_canfd_callbacks() -> None:
+_callback_lock = threading.Lock()
+_callbacks_installed = False
+_can_tx_callback: Optional[Callable[[int, int, Any], bool]] = None
+_can_rx_callback: Optional[Callable[[int, int, int], Tuple[int, bytes]]] = None
+
+
+def setup_bxipci_callbacks() -> None:
     _check_sdk()
     runtime = BxiPciRosRuntime.instance()
+    global _callbacks_installed, _can_tx_callback, _can_rx_callback
 
-    def canfd_send(slave_id: int, canfd_id: int, data: Any) -> bool:
-        bridge = runtime.current_bridge()
-        if bridge is None:
-            return False
+    with _callback_lock:
+        if _callbacks_installed:
+            return
 
-        payload = bytes(data)
-        bus = bridge.bus_for_slave(slave_id)
-        can_id = (int(canfd_id) & CAN_EFF_MASK) | CAN_EFF_FLAG
-        return bridge.send_packet(bus, can_id, payload, CANFD_BRS | CANFD_FDF)
+        def can_send(slave_id: int, can_id: int, data: Any) -> bool:
+            bridge = runtime.current_bridge()
+            if bridge is None:
+                return False
 
-    def canfd_read(
-        slave_id: int, expected_can_id: int, _expected_frames: int
-    ) -> Tuple[int, bytes]:
-        bridge = runtime.current_bridge()
-        if bridge is None:
-            return 0, bytes()
+            bus = bridge.bus_for_slave(slave_id)
+            is_canfd = bridge.is_canfd_for_slave(slave_id)
+            if is_canfd:
+                packet_id = (int(can_id) & CAN_EFF_MASK) | CAN_EFF_FLAG
+                return bridge.send_packet(
+                    bus,
+                    packet_id,
+                    bytes(data),
+                    CANFD_BRS | CANFD_FDF,
+                    MAX_CANFD_DATA_LEN,
+                )
 
-        bus = bridge.bus_for_slave(slave_id)
-        result = bridge.receive_canfd(bus, expected_can_id, BXI_PCI_RX_WAIT_TIME_MS)
-        if result is None:
-            return 0, bytes()
-        return result
+            packet_id = int(can_id) & CAN_EFF_MASK
+            return bridge.send_packet(bus, packet_id, bytes(data), 0, MAX_CAN_DATA_LEN)
 
-    libstark.set_can_tx_callback(canfd_send)
-    libstark.set_can_rx_callback(canfd_read)
+        def can_read(
+            slave_id: int, expected_can_id: int, expected_frames: int
+        ) -> Tuple[int, bytes]:
+            bridge = runtime.current_bridge()
+            if bridge is None:
+                return 0, bytes()
+
+            bus = bridge.bus_for_slave(slave_id)
+            if bridge.is_canfd_for_slave(slave_id):
+                result = bridge.receive_canfd(
+                    bus, expected_can_id, BXI_PCI_RX_WAIT_TIME_MS
+                )
+            else:
+                result = bridge.receive_can(
+                    bus,
+                    expected_can_id,
+                    expected_frames,
+                    BXI_PCI_RX_WAIT_TIME_MS,
+                )
+            if result is None:
+                return 0, bytes()
+            return result
+
+        _can_tx_callback = can_send
+        _can_rx_callback = can_read
+        libstark.set_can_tx_callback(_can_tx_callback)
+        libstark.set_can_rx_callback(_can_rx_callback)
+        _callbacks_installed = True
+
+
+def setup_bxipci_can_callbacks() -> None:
+    bridge = BxiPciRosRuntime.instance().current_bridge()
+    if bridge is not None:
+        bridge.set_default_protocol(False)
+    setup_bxipci_callbacks()
+
+
+def setup_bxipci_canfd_callbacks() -> None:
+    bridge = BxiPciRosRuntime.instance().current_bridge()
+    if bridge is not None:
+        bridge.set_default_protocol(True)
+    setup_bxipci_callbacks()
 
 
 async def init_bxipci_device(
@@ -360,15 +503,14 @@ async def init_bxipci_device(
     hw_type: Any = None,
 ) -> BxiDeviceContext:
     _check_sdk()
-    if not is_canfd:
-        raise NotImplementedError("The Python bridge currently keeps only the BxiPci CANFD backend.")
 
     runtime = BxiPciRosRuntime.instance()
     bridge = runtime.ensure_bridge(bus)
-    bridge.register_slave_bus(slave_id, bus)
-    setup_bxipci_canfd_callbacks()
+    bridge.set_default_protocol(is_canfd)
+    bridge.register_slave(slave_id, bus, is_canfd)
+    setup_bxipci_callbacks()
 
-    protocol = libstark.StarkProtocolType.CanFd
+    protocol = libstark.StarkProtocolType.CanFd if is_canfd else libstark.StarkProtocolType.Can
     if hw_type is None:
         hw_type = libstark.StarkHardwareType.Revo2Basic
     handle = libstark.init_device_handler(
@@ -382,7 +524,7 @@ async def init_bxipci_device(
         handle=handle,
         bus=int(bus),
         slave_id=int(slave_id) & 0xFF,
-        is_canfd=True,
+        is_canfd=is_canfd,
         protocol_type=protocol,
         hw_type=hw_type,
     )
