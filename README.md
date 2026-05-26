@@ -2,9 +2,9 @@
 
 Revo2 灵巧手BXI can接口 ROS 2 示例程序，基于 bc-stark-sdk 实现手指位置控制、速度控制、力反馈等演示功能。
 
-**更多请关注官方例程** - https://github.com/BrainCoTech/brainco-hand-sdk.git
+**更多请关注官方例程** - <https://github.com/BrainCoTech/brainco-hand-sdk.git>
 
-我们仅移植底层通信接口去调用官方的sdk
+我们仅移植底层通信接口去调用官方的sdk,若官方更新只需要执行./download-lib.sh更新c++sdk，pip install bc-stark-sdk --upgrade更新python sdk
 
 所有功能都包含在官方sdk中dist/include/stark-sdk.h
 
@@ -43,6 +43,7 @@ Python 示例通过 `bc_stark_sdk` 调用官方 SDK，只移植最底层 BxiPci 
 ```
 
 `download-lib.sh` 会根据当前操作系统和架构自动选择对应的库文件：
+
 - **Linux x86_64**: `linux.zip`
 - **Linux aarch64**: `linux-arm64.zip`
 - **macOS**: `mac.zip`
