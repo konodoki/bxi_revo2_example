@@ -66,6 +66,47 @@ source /opt/ros/humble/setup.bash
 # 4. 使用 colcon 编译
 colcon build --packages-select bxi_revo2_example
 ```
+## 准备工作
+
+### 1.将左手插入bxi主控板的CAN5，默认id为126.右手插入bxi主控板的CAN6，默认id为127
+
+在代码中分别对应
+
+```c
+BxiDeviceContext left_ctx_;
+BxiDeviceContext right_ctx_;
+left_ctx_.hw_type_override = STARK_HARDWARE_TYPE_REVO2_BASIC;
+right_ctx_.hw_type_override = STARK_HARDWARE_TYPE_REVO2_BASIC;
+left_ctx_.master_id = 1;
+right_ctx_.master_id = 1;
+if (!init_bxipci_device(&left_ctx_, 5, 126, true)) {
+    rclcpp::shutdown();
+    return 1;
+}
+if (!init_bxipci_device(&right_ctx_, 6, 127, true)) {
+    rclcpp::shutdown();
+    return 1;
+}
+```
+```python
+left_ctx = await init_bxipci_device(
+    5,
+    126,
+    master_id=1,
+    is_canfd=True,
+    hw_type=libstark.StarkHardwareType.Revo2Basic,
+)
+right_ctx = await init_bxipci_device(
+    6,
+    127,
+    master_id=1,
+    is_canfd=True,
+    hw_type=libstark.StarkHardwareType.Revo2Basic,
+)
+```
+### 2.启动硬件节点
+
+这一步通常只需要你成功启动机器人，观察到机器人电机指示灯亮起后revo2应当会张开
 
 ## 运行
 
